@@ -1,0 +1,416 @@
+import numpy as np
+import pandas as pd
+from collections import Counter, defaultdict
+import itertools
+import random
+
+# === Configuration globale ===
+class Config:
+    N_STATIONS = 7
+    TRAM_CAPACITY = 50
+    SIM_DURATION = 900
+    TIME_STEP = 1
+    STOP_DURATION = 2  # Réduit pour plus de fluidité
+    N_TRAMS = 1
+    VRP_LOOKAHEAD = 3
+    #MAX_WAIT_TIME = 15
+
+# === Matrice des temps de trajet ===
+travel_time = np.array([
+    [0, 10, 20, 35, 50, 60, 75],
+    [10, 0, 10, 25, 40, 50, 65],
+    [20, 10, 0, 15, 30, 40, 55],
+    [35, 25, 15, 0, 15, 25, 40],
+    [50, 40, 30, 15, 0, 10, 25],
+    [60, 50, 40, 25, 10, 0, 15],
+    [75, 65, 55, 40, 25, 15, 0],
+])
+
+# === Classe TransportRequest améliorée ===
+class TransportRequest:
+    def __init__(self, req_type, departure, arrival, creation_time, hide_time, arrival_deadline=None):
+        self.type = req_type
+        self.departure = int(departure)
+        self.arrival = int(arrival)
+        self.creation_time = int(creation_time)
+        self.hide_time = int(hide_time)
+        self.arrival_deadline = int(arrival_deadline) if arrival_deadline is not None else None
+        self.status = "waiting"
+        self.arrived_time = None
+        self.delivered_late = False
+        self.boarded_time = None
+
+    def is_visible(self, current_time, horizon=0):
+        """Vérifie si la demande est visible dans l'horizon"""
+        return self.creation_time <= current_time + horizon
+
+    def is_expired(self, current_time):
+        """Vérifie si la demande a expiré"""
+        return current_time > self.hide_time
+
+# === Classe Tram avec VRP fonctionnel ===
+class Tram:
+    def __init__(self, tram_id, start_position=0):
+        self.id = tram_id
+        self.position = start_position
+        self.capacity = Config.TRAM_CAPACITY
+        self.passengers = []
+        self.route = []
+        self.next_station = None
+        self.remaining_time = 0
+        self.waiting_time = 0
+        self.stats = {"passengers_served": 0, "units_served": 0}
+        self.last_vrp_time = -100
+
+    def drop_off(self, current_time):
+        """Débarque les passagers arrivés à destination"""
+        served = []
+        remaining_passengers = []
+
+        for passenger in self.passengers:
+            if passenger.arrival == self.position:
+                passenger.status = "served"
+                passenger.arrived_time = current_time
+
+                if passenger.arrival_deadline is not None:
+                    passenger.delivered_late = current_time > passenger.arrival_deadline
+
+                if passenger.type == "passenger":
+                    self.stats["passengers_served"] += 1
+                else:
+                    self.stats["units_served"] += 1
+
+                served.append(passenger)
+            else:
+                remaining_passengers.append(passenger)
+
+        self.passengers = remaining_passengers
+        return served
+
+    def pick_up(self, station_requests, current_time):
+        """Embarque les demandes de la station actuelle"""
+        onboarded = []
+        remaining_requests = []
+
+        for request in station_requests:
+            if (len(self.passengers) < self.capacity and
+                request.departure == self.position and
+                request.status == "waiting" and
+                not request.is_expired(current_time)):
+
+                request.status = "onboard"
+                request.boarded_time = current_time
+                onboarded.append(request)
+                self.passengers.append(request)
+            else:
+                remaining_requests.append(request)
+
+        return onboarded, remaining_requests
+
+    def calculate_path_time(self, path):
+        """Calcule le temps total pour un chemin"""
+        if len(path) < 2:
+            return 0
+        total_time = 0
+        for i in range(len(path) - 1):
+            total_time += travel_time[path[i], path[i+1]] + Config.STOP_DURATION
+        return total_time
+
+    def find_optimal_vrp_sequence(self, all_requests, current_time, horizon):
+        """VRP amélioré avec évaluation réaliste"""
+        best_sequence = []
+        best_score = -9999
+
+        # Stations accessibles
+        candidate_stations = [s for s in range(Config.N_STATIONS) if s != self.position]
+
+        # Filtrer demandes visibles et non expirées
+        visible_requests = [
+            r for r in all_requests
+            if r.is_visible(current_time, horizon) and not r.is_expired(current_time) and r.status == "waiting"
+        ]
+
+        if not visible_requests and not self.passengers:
+            return [random.choice(candidate_stations)], 0
+
+        # Essayer séquences de différentes longueurs
+        for seq_length in range(1, min(Config.VRP_LOOKAHEAD, len(candidate_stations)) + 1):
+            for sequence in itertools.permutations(candidate_stations, seq_length):
+                path = [self.position] + list(sequence)
+                score = self.evaluate_path_score(path, visible_requests, current_time, horizon)
+
+                if score > best_score:
+                    best_score = score
+                    best_sequence = list(sequence)
+
+        return best_sequence, best_score
+
+    def evaluate_path_score(self, path, visible_requests, current_time, horizon):
+        """Évaluation réaliste d'un chemin"""
+        if len(path) < 2:
+            return 0
+
+        score = 0
+        current_capacity = self.capacity - len(self.passengers)
+        simulated_time = current_time
+        visited_stations = set()
+
+        # Simuler le parcours
+        for i in range(len(path) - 1):
+            from_st, to_st = path[i], path[i+1]
+            travel_duration = travel_time[from_st, to_st]
+            simulated_time += travel_duration
+
+            # Arrêt à la station d'arrivée
+            simulated_time += Config.STOP_DURATION
+
+            # Demandes à cette station
+            station_requests = [r for r in visible_requests if r.departure == to_st]
+
+            if station_requests and to_st not in visited_stations:
+                # Compter demandes servables (dans la fenêtre temporelle)
+                valid_requests = [r for r in station_requests if r.creation_time <= simulated_time]
+                servable = min(len(valid_requests), current_capacity)
+
+                # Score basé sur le nombre de demandes et l'urgence
+                request_score = 0
+                for req in valid_requests[:servable]:
+                    time_urgency = max(0, req.hide_time - simulated_time)
+                    urgency_bonus = 10 if time_urgency < 30 else 5 if time_urgency < 60 else 1
+                    request_score += urgency_bonus
+
+                score += request_score
+                current_capacity -= servable
+                visited_stations.add(to_st)
+
+            # Pénalité distance
+            score -= travel_duration * 0.5
+
+            # Bonus pour destinations des passagers actuels
+            #for passenger in self.passengers:
+             #   if passenger.arrival == to_st:
+              #      score += 20  # Fort bonus pour débarquer un passager
+            
+            for unit in self.passengers:
+                if unit.arrival == to_st and unit.type == "logistic_unit":
+                    score += 20  # Fort bonus pour débarquer une unité logistique
+                    
+        return score
+
+    def decide_route(self, all_requests, current_time, horizon):
+        """Décision de route avec VRP prioritaire"""
+        # Réévaluer le VRP périodiquement (toutes les 20-30 minutes)
+        use_vrp = (current_time - self.last_vrp_time > 20) or not self.route
+
+        if use_vrp:
+            best_sequence, vrp_score = self.find_optimal_vrp_sequence(all_requests, current_time, horizon)
+
+            if best_sequence and vrp_score > -10:  # Seuil bas pour utilisation
+                self.route = best_sequence
+                self.last_vrp_time = current_time
+                return
+
+        # Fallback si pas de VRP valide
+        if self.passengers:
+            # Aller vers la destination la plus proche
+            closest_dest = min(self.passengers, key=lambda p: travel_time[self.position, p.arrival])
+            self.route = [closest_dest.arrival]
+        elif not self.route:
+            # Station aléatoire si aucune idée
+            available = [s for s in range(Config.N_STATIONS) if s != self.position]
+            self.route = [random.choice(available)] if available else []
+
+    def move_to_next_station(self):
+        """Déplace le tram vers la prochaine station"""
+        if self.route:
+            next_station = self.route[0]
+            self.next_station = next_station
+            self.remaining_time = travel_time[self.position, next_station]
+            self.route = self.route[1:]  # Retirer la station atteinte
+
+    def complete_move(self):
+        """Finalise le déplacement"""
+        if self.next_station is not None:
+            self.position = self.next_station
+            self.next_station = None
+            self.waiting_time = Config.STOP_DURATION
+
+# === Simulation améliorée ===
+def run_simulation(horizon):
+    # Réinitialiser toutes les demandes
+    for req in all_requests:
+        req.status = "waiting"
+        req.arrived_time = None
+        req.delivered_late = False
+        req.boarded_time = None
+
+    # Initialisation
+    trams = [
+        Tram(0, start_position=0),
+        #Tram(1, start_position=3),
+        #Tram(2, start_position=6)
+    ]
+
+    stations = [[] for _ in range(Config.N_STATIONS)]
+    time = 0
+
+    # Statistiques détaillées
+    simulation_stats = {
+        "time": [],
+        "waiting_requests": [],
+        "onboard_requests": [],
+        "served_requests": []
+    }
+
+    while time < Config.SIM_DURATION:
+        # Mise à jour des nouvelles demandes
+        new_requests = [r for r in all_requests if r.creation_time == time and r.status == "waiting"]
+        for req in new_requests:
+            stations[req.departure].append(req)
+
+        # Nettoyage des demandes expirées
+        for station in stations:
+            remaining = []
+            for req in station:
+                if req.is_expired(time) and req.status == "waiting":
+                    req.status = "lost"
+                else:
+                    remaining.append(req)
+            station.clear()
+            station.extend(remaining)
+
+        # Mise à jour des trams
+        for tram in trams:
+            if tram.remaining_time > 0:
+                # En déplacement
+                tram.remaining_time -= Config.TIME_STEP
+                if tram.remaining_time <= 0:
+                    tram.complete_move()
+
+                    # Débarquement à l'arrivée
+                    tram.drop_off(time)
+
+                    # Embarquement
+                    onboarded, remaining = tram.pick_up(stations[tram.position], time)
+                    stations[tram.position] = remaining
+
+            elif tram.waiting_time > 0:
+                # En arrêt
+                tram.waiting_time -= Config.TIME_STEP
+
+            else:
+                # Prêt à bouger
+                if not tram.route:
+                    tram.decide_route(all_requests, time, horizon)
+
+                if tram.route:
+                    tram.move_to_next_station()
+
+        # Collecte des stats
+        if time % 30 == 0:  # Toutes les 30 minutes
+            waiting_count = sum(1 for r in all_requests if r.status == "waiting")
+            onboard_count = sum(1 for r in all_requests if r.status == "onboard")
+            served_count = sum(1 for r in all_requests if r.status == "served")
+
+            simulation_stats["time"].append(time)
+            simulation_stats["waiting_requests"].append(waiting_count)
+            simulation_stats["onboard_requests"].append(onboard_count)
+            simulation_stats["served_requests"].append(served_count)
+
+        time += Config.TIME_STEP
+
+    # Nettoyage final
+    for tram in trams:
+        for passenger in tram.passengers:
+            if passenger.status == "onboard":
+                passenger.status = "lost"
+
+    # Calcul des résultats finaux
+    logistic_units = [r for r in all_requests if r.type == "logistic_unit"]
+
+    served_on_time = sum(1 for r in logistic_units
+                        if r.status == "served" and not r.delivered_late)
+    served_late = sum(1 for r in logistic_units
+                     if r.status == "served" and r.delivered_late)
+    lost = sum(1 for r in logistic_units if r.status == "lost")
+
+    total_served = served_on_time + served_late
+    success_rate = (total_served / len(logistic_units)) * 100 if logistic_units else 0
+
+    print(f"Horizon {horizon:3d} min → {served_on_time:2d} à l'heure, {served_late:2d} retard, {lost:2d} perdus ({success_rate:5.1f}% succès)")
+
+    return {
+        "horizon": horizon,
+        "served_on_time": served_on_time,
+        "served_late": served_late,
+        "lost": lost,
+        "success_rate": success_rate,
+        "stats": simulation_stats
+    }
+
+# === Chargement des données ===
+print("Chargement des demandes...")
+df = pd.read_csv("demandes_2A_0.csv")
+all_requests = []
+
+for _, row in df.iterrows():
+    req = TransportRequest(
+        row['type'],
+        int(row['departure']),
+        int(row['arrival']),
+        int(row['creation_time']),
+        int(row['hide_time']),
+        row.get('arrival_deadline')
+    )
+    all_requests.append(req)
+
+print(f"✅ {len(all_requests)} demandes chargées")
+
+# === Exécution des simulations ===
+print("\n" + "="*60)
+print("DÉMARRAGE DES SIMULATIONS AVEC VRP FONCTIONNEL")
+print("="*60)
+
+horizons_to_test = [0, 10, 20, 30, 40, 50, 60]
+results = []
+
+for horizon in horizons_to_test:
+    results.append(run_simulation(horizon))
+
+# === Affichage des résultats ===
+print("\n" + "="*60)
+print("RÉSULTATS FINAUX COMPARATIFS")
+print("="*60)
+print("Horizon | À l'heure | En retard | Perdus | Taux Succès")
+print("-" * 55)
+
+best_result = max(results, key=lambda x: x['served_on_time'])
+
+for res in results:
+    highlight = " 🏆" if res == best_result else ""
+    print(f"{res['horizon']:7} | {res['served_on_time']:9} | {res['served_late']:9} | {res['lost']:6} | {res['success_rate']:10.1f}%{highlight}")
+
+# === Analyse détaillée ===
+print("\n" + "="*60)
+print("ANALYSE DE PERFORMANCE")
+print("="*60)
+
+improvement = best_result['served_on_time'] - results[0]['served_on_time']
+improvement_pct = (improvement / results[0]['served_on_time']) * 100 if results[0]['served_on_time'] > 0 else 0
+
+print(f"Meilleur horizon: {best_result['horizon']} minutes")
+print(f"Amélioration vs horizon 0: +{improvement} unités ({improvement_pct:+.1f}%)")
+print(f"Taux de livraison à l'heure maximum: {best_result['success_rate']:.1f}%")
+
+if improvement > 0:
+    print("✅ La vision future AMÉLIORE les performances!")
+else:
+    print("❌ La vision future n'apporte pas d'amélioration significative")
+
+# === Statistiques par tram ===
+print("\n" + "="*60)
+print("STATISTIQUES PAR TRAM (dernière simulation)")
+print("="*60)
+
+# Réexécuter pour avoir les stats des trams
+final_sim = run_simulation(best_result['horizon'])
