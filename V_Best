@@ -1,0 +1,867 @@
+import numpy as np
+import pandas as pd
+from collections import Counter, defaultdict, deque
+import itertools
+import random
+from scipy import stats
+import math
+
+# === Configuration globale AVANCÉE ===
+class Config:
+    N_STATIONS = 7
+    TRAM_CAPACITY = 50
+    SIM_DURATION = 900
+    TIME_STEP = 1
+    STOP_DURATION = 2
+    N_TRAMS = 2
+    VRP_LOOKAHEAD = 3
+
+    # 🧠 Système de mémoire avancé
+    MEMORY_SIZE = 30
+    SHORT_TERM_WEIGHT = 0.4
+    MEDIUM_TERM_WEIGHT = 0.3
+    LONG_TERM_WEIGHT = 0.3
+    EXPLORATION_BONUS = 3.0
+    PAST_PATTERN_WEIGHT = 0.25
+
+    # ⚡ Paramètres d'optimisation avancée
+    ADAPTIVE_LEARNING_RATE = 0.1
+    DEMAND_PREDICTION_WEIGHT = 0.4
+    COLLABORATION_BONUS = 2.0
+    ENERGY_EFFICIENCY_PENALTY = 0.1
+
+    # 🕒 Fenêtres temporelles
+    EARLY_PENALTY_RATE = 0.3
+    LATE_PENALTY = 35
+    WINDOW_BONUS_MAX = 18
+    TIME_WINDOW_STRICTNESS = 0.85
+
+    # 🎯 Scoring avancé
+    W_IMMEDIATE = 3.5
+    W_NEAR = 2.2
+    W_FAR = 1.1
+    DIST_PENALTY = 0.4
+    URGENCY_BONUS = 6.0
+    CONGESTION_PENALTY = 0.2
+
+# === Matrice des temps de trajet ===
+travel_time = np.array([
+    [0, 10, 20, 35, 50, 60, 75],
+    [10, 0, 10, 25, 40, 50, 65],
+    [20, 10, 0, 15, 30, 40, 55],
+    [35, 25, 15, 0, 15, 25, 40],
+    [50, 40, 30, 15, 0, 10, 25],
+    [60, 50, 40, 25, 10, 0, 15],
+    [75, 65, 55, 40, 25, 15, 0],
+])
+
+# === Système de prédiction de demande ===
+class DemandPredictor:
+    def __init__(self, n_stations):
+        self.n_stations = n_stations
+        self.demand_history = defaultdict(lambda: deque(maxlen=100))
+        self.pattern_weights = defaultdict(lambda: 1.0)
+
+    def record_demand(self, station, time, demand_level):
+        """Enregistre la demande historique"""
+        key = (station, time // 30)  # Regroupe par tranches de 30 minutes
+        self.demand_history[key].append(demand_level)
+
+    def predict_demand(self, station, current_time):
+        """Prédit la demande future basée sur l'historique"""
+        future_time = current_time + 30  # Prédiction 30 minutes à l'avance
+        key = (station, future_time // 30)
+
+        if key in self.demand_history and self.demand_history[key]:
+            historical_avg = np.mean(self.demand_history[key])
+            return historical_avg * self.pattern_weights[key]
+        return 0.5  # Valeur par défaut
+
+# === Classe TransportRequest AMÉLIORÉE ===
+class TransportRequest:
+    def __init__(self, req_type, departure, arrival, creation_time, hide_time, arrival_deadline=None, priority=1):
+        self.type = req_type
+        self.departure = int(departure)
+        self.arrival = int(arrival)
+        self.creation_time = int(creation_time)
+        self.hide_time = int(hide_time)
+        self.arrival_deadline = int(arrival_deadline) if arrival_deadline is not None else None
+        self.priority = priority
+        self.status = "waiting"
+        self.arrived_time = None
+        self.delivered_late = False
+        self.boarded_time = None
+
+    def is_visible(self, current_time, horizon=0):
+        return self.creation_time <= current_time + horizon
+
+    def is_expired(self, current_time):
+        return current_time > self.hide_time
+
+    def get_urgency_level(self, current_time):
+        time_until_hide = self.hide_time - current_time
+        if time_until_hide <= 10:
+            return "immediate"
+        elif time_until_hide <= 30:
+            return "near"
+        else:
+            return "far"
+
+    def get_urgency_score(self, current_time):
+        time_until_hide = self.hide_time - current_time
+        base_urgency = max(0, 1 - (time_until_hide / 60))
+        return base_urgency * self.priority * Config.URGENCY_BONUS
+
+# === Classe Tram OPTIMISÉE pour unités logistiques ===
+class Tram:
+    def __init__(self, tram_id, start_position=0, demand_predictor=None):
+        self.id = tram_id
+        self.position = start_position
+        self.capacity = Config.TRAM_CAPACITY
+        self.logistic_units = []  # 🚛 CHANGEMENT: units au lieu de passengers
+        self.route = []
+        self.next_station = None
+        self.remaining_time = 0
+        self.waiting_time = 0
+        self.stats = {"units_served": 0, "total_distance": 0}  # 🚛 CHANGEMENT: que units_served
+        self.last_vrp_time = -100
+
+        # 🧠 Système de mémoire avancé
+        self.movement_memory = deque(maxlen=Config.MEMORY_SIZE)
+        self.station_visit_count = defaultdict(int)
+        self.pattern_memory = []
+        self.performance_history = deque(maxlen=50)
+
+        # ⚡ Apprentissage adaptatif
+        self.demand_predictor = demand_predictor
+        self.learning_rates = {
+            "short_term": 0.5,
+            "medium_term": 0.3,
+            "long_term": 0.2
+        }
+
+        # Mémoire des performances par horizon
+        self.horizon_performance = {
+            "short_term": {"success": 0, "attempts": 0, "recent_success": deque(maxlen=10)},
+            "medium_term": {"success": 0, "attempts": 0, "recent_success": deque(maxlen=10)},
+            "long_term": {"success": 0, "attempts": 0, "recent_success": deque(maxlen=10)}
+        }
+
+    # 🧠 MÉTHODES DE SCORING MULTI-HORIZON
+    def compute_multi_horizon_station_score(self, station, current_time, visible_requests):
+        """Scoring multi-horizon avec compromis dynamique"""
+        short_weight, medium_weight, long_weight = self.dynamic_horizon_balance(current_time)
+
+        # Calcule les scores pour chaque horizon
+        short_term_score = self._compute_horizon_score(station, current_time, visible_requests, 30, Config.W_IMMEDIATE)
+        medium_term_score = self._compute_horizon_score(station, current_time, visible_requests, 90, Config.W_NEAR)
+        long_term_score = self._compute_horizon_score(station, current_time, visible_requests, 300, Config.W_FAR)
+
+        # Score composite avec poids dynamiques
+        composite_score = (short_term_score * short_weight +
+                         medium_term_score * medium_weight +
+                         long_term_score * long_weight)
+
+        # Ajoute le bonus d'exploration
+        exploration_bonus = self.get_station_exploration_bonus(station)
+        composite_score += exploration_bonus
+
+        # Ajoute l'analyse des patterns
+        pattern_bonus = self.analyze_past_patterns(station)
+        composite_score += pattern_bonus
+
+        # Pénalité de distance
+        distance = travel_time[self.position, station]
+        composite_score -= Config.DIST_PENALTY * distance
+
+        return composite_score
+
+    def _compute_horizon_score(self, station, current_time, visible_requests, horizon, base_weight):
+        """Calcule le score pour un horizon spécifique"""
+        score = 0.0
+        current_capacity = self.capacity - len(self.logistic_units)  # 🚛 CHANGEMENT
+
+        # Filtre les demandes dans l'horizon
+        horizon_requests = [r for r in visible_requests
+                          if r.creation_time <= current_time + horizon]
+
+        station_requests = [r for r in horizon_requests if r.departure == station]
+
+        for req in station_requests:
+            # Urgence dans le contexte de l'horizon
+            time_until_visible = max(0, req.creation_time - current_time)
+            horizon_urgency = max(0, 1 - (time_until_visible / horizon))
+
+            # Bonus d'urgence standard
+            time_until_hide = req.hide_time - current_time
+            urgency_bonus = Config.URGENCY_BONUS * max(0, 1 - time_until_hide / 60)
+
+            score += base_weight * horizon_urgency + urgency_bonus
+
+        # Limite par la capacité
+        capacity_factor = min(1.0, current_capacity / len(station_requests)) if station_requests else 0
+        score *= capacity_factor
+
+        return score
+
+    def get_station_exploration_bonus(self, station):
+        """Calcule le bonus d'exploration pour une station peu visitée"""
+        total_visits = sum(self.station_visit_count.values())
+        if total_visits == 0:
+            return Config.EXPLORATION_BONUS
+
+        visit_frequency = self.station_visit_count[station] / total_visits
+        exploration_bonus = Config.EXPLORATION_BONUS * (1 - visit_frequency)
+        return exploration_bonus
+
+    def analyze_past_patterns(self, candidate_station):
+        """Analyse les patterns passés pour évaluer une station candidate"""
+        if len(self.pattern_memory) < 5:
+            return 0
+
+        recent_movements = [m["to"] for m in list(self.movement_memory)[-2:]] + [candidate_station]
+        candidate_pattern = tuple(recent_movements)
+
+        pattern_count = self.pattern_memory.count(candidate_pattern)
+        pattern_frequency = pattern_count / len(self.pattern_memory)
+
+        return pattern_frequency * Config.PAST_PATTERN_WEIGHT
+
+    # ⚡ Méthodes d'apprentissage adaptatif
+    def update_learning_rates(self, success_rates):
+        """Met à jour dynamiquement les taux d'apprentissage"""
+        for horizon in self.learning_rates:
+            if success_rates[horizon] > 0.7:
+                self.learning_rates[horizon] *= 0.9
+            elif success_rates[horizon] < 0.3:
+                self.learning_rates[horizon] *= 1.1
+
+            self.learning_rates[horizon] = max(0.1, min(1.0, self.learning_rates[horizon]))
+
+    def adaptive_exploration_bonus(self, station):
+        """Bonus d'exploration adaptatif basé sur la performance"""
+        base_bonus = Config.EXPLORATION_BONUS
+        total_visits = sum(self.station_visit_count.values())
+
+        if total_visits == 0:
+            return base_bonus
+
+        visit_frequency = self.station_visit_count[station] / total_visits
+        recent_success_rate = np.mean(list(self.horizon_performance["short_term"]["recent_success"])) if self.horizon_performance["short_term"]["recent_success"] else 0.5
+
+        exploration_boost = 1 + (1 - recent_success_rate)
+        return base_bonus * (1 - visit_frequency) * exploration_boost
+
+    def record_movement(self, from_station, to_station, success_score, units_change):
+        """Enregistrement avancé des mouvements"""
+        movement = {
+            "from": from_station,
+            "to": to_station,
+            "time": len(self.movement_memory),
+            "success": success_score,
+            "units_change": units_change,  # 🚛 CHANGEMENT
+            "efficiency": units_change / max(1, travel_time[from_station, to_station])
+        }
+        self.movement_memory.append(movement)
+        self.station_visit_count[to_station] += 1
+
+        if len(self.movement_memory) >= 3:
+            recent_pattern = tuple([m["to"] for m in list(self.movement_memory)[-3:]])
+            self.pattern_memory.append(recent_pattern)
+
+            pattern_efficiency = np.mean([m["efficiency"] for m in list(self.movement_memory)[-3:]])
+            self.performance_history.append(pattern_efficiency)
+
+    # 🎯 Scoring avec prédiction de demande
+    def compute_predictive_station_score(self, station, current_time, visible_requests):
+        """Score intégrant la prédiction de demande future"""
+        current_score = self.compute_multi_horizon_station_score(station, current_time, visible_requests)
+
+        if self.demand_predictor:
+            predicted_demand = self.demand_predictor.predict_demand(station, current_time)
+            prediction_bonus = predicted_demand * Config.DEMAND_PREDICTION_WEIGHT * 10
+
+            current_demand = len([r for r in visible_requests if r.departure == station])
+            self.demand_predictor.record_demand(station, current_time, current_demand)
+
+            return current_score + prediction_bonus
+
+        return current_score
+
+    # ⚡ Optimisation pour unités logistiques
+    def compute_energy_efficiency(self, from_station, to_station, units_count):
+        """Calcule l'efficacité énergétique du trajet"""
+        distance = travel_time[from_station, to_station]
+        if distance == 0:
+            return 1.0
+
+        efficiency = units_count / distance  # 🚛 unités par minute de trajet
+        return max(0.1, efficiency)
+
+    def dynamic_horizon_balance(self, current_time):
+        """Équilibrage dynamique AVANCÉ des horizons"""
+        success_rates = {}
+
+        for horizon_type in self.horizon_performance:
+            attempts = self.horizon_performance[horizon_type]["attempts"]
+            success = self.horizon_performance[horizon_type]["success"]
+            recent_success = list(self.horizon_performance[horizon_type]["recent_success"])
+
+            if attempts > 0:
+                historical_rate = success / attempts
+                recent_rate = np.mean(recent_success) if recent_success else historical_rate
+                success_rates[horizon_type] = 0.3 * historical_rate + 0.7 * recent_rate
+            else:
+                success_rates[horizon_type] = 0.5
+
+        self.update_learning_rates(success_rates)
+
+        total_rate = sum(success_rates.values())
+        if total_rate > 0:
+            weights = {}
+            for horizon_type in success_rates:
+                weights[horizon_type] = (success_rates[horizon_type] / total_rate) * 0.8 + 0.2
+            return weights["short_term"], weights["medium_term"], weights["long_term"]
+
+        return Config.SHORT_TERM_WEIGHT, Config.MEDIUM_TERM_WEIGHT, Config.LONG_TERM_WEIGHT
+
+    # 🎯 Méthode de scoring unifiée avancée
+    def compute_unified_station_score(self, station, current_time, visible_requests, other_trams=None):
+        """Score unifié intégrant tous les aspects avancés"""
+        base_score = self.compute_predictive_station_score(station, current_time, visible_requests)
+
+        energy_efficiency = self.compute_energy_efficiency(self.position, station, len(self.logistic_units))  # 🚛 CHANGEMENT
+        base_score *= energy_efficiency
+
+        exploration_bonus = self.adaptive_exploration_bonus(station)
+        base_score += exploration_bonus
+
+        if other_trams:
+            collaboration_score = self.compute_collaboration_score(station, other_trams, current_time)
+            base_score += collaboration_score
+
+        congestion_penalty = self.compute_congestion_penalty(station, visible_requests)
+        base_score -= congestion_penalty
+
+        return base_score
+
+    # 🤝 Collaboration entre trams
+    def compute_collaboration_score(self, station, other_trams, current_time):
+        """Évite que tous les trams aillent vers la même station"""
+        collaboration_bonus = 0
+        tram_positions = [tram.position for tram in other_trams if tram.id != self.id]
+
+        if tram_positions:
+            min_distance_to_other_tram = min([travel_time[tram_pos, station] for tram_pos in tram_positions])
+            if min_distance_to_other_tram < 20:
+                collaboration_bonus = -Config.COLLABORATION_BONUS
+            else:
+                collaboration_bonus = Config.COLLABORATION_BONUS
+
+        return collaboration_bonus
+
+    # 📊 Gestion de congestion
+    def compute_congestion_penalty(self, station, visible_requests):
+        """Pénalise les stations avec trop de demandes en attente"""
+        station_requests = [r for r in visible_requests if r.departure == station]
+        congestion_level = len(station_requests) / self.capacity
+        return congestion_level * Config.CONGESTION_PENALTY * 10
+
+    # 🎯 Score rapide pour pré-sélection VRP
+    def compute_quick_station_score(self, station, current_time, visible_requests, other_trams=None):
+        """Score RAPIDE pour pré-sélection"""
+        score = 0.0
+
+        station_requests = [r for r in visible_requests if r.departure == station]
+
+        for req in station_requests:
+            time_until_hide = req.hide_time - current_time
+            if time_until_hide <= 20:
+                score += 15
+            elif time_until_hide <= 40:
+                score += 8
+            else:
+                score += 3
+
+        distance = travel_time[self.position, station]
+        score -= distance * 0.5
+
+        total_visits = sum(self.station_visit_count.values())
+        if total_visits > 0:
+            visit_ratio = self.station_visit_count[station] / total_visits
+            score += (1 - visit_ratio) * 5
+
+        if other_trams:
+            for tram in other_trams:
+                if tram.position == station or (tram.route and tram.route[0] == station):
+                    score -= 10
+
+        return score
+
+    def evaluate_path_with_time_windows(self, path, visible_requests, current_time, horizon, other_trams=None):
+        """Évaluation AVANCÉE avec toutes les optimisations"""
+        if len(path) < 2:
+            return 0
+
+        total_score = 0.0
+        current_capacity = self.capacity - len(self.logistic_units)  # 🚛 CHANGEMENT
+        simulated_time = current_time
+        visited_stations = set()
+
+        for i in range(len(path) - 1):
+            from_st, to_st = path[i], path[i+1]
+            travel_duration = travel_time[from_st, to_st]
+            simulated_time += travel_duration
+
+            station_score = self.compute_unified_station_score(to_st, current_time, visible_requests, other_trams)
+            total_score += station_score
+
+            arrival_time_at_station = simulated_time
+            station_requests = [r for r in visible_requests if r.departure == to_st and r.status == "waiting"]
+
+            for req in station_requests:
+                if arrival_time_at_station >= req.creation_time and arrival_time_at_station <= req.hide_time:
+                    urgency_bonus = req.get_urgency_score(current_time)
+                    total_score += urgency_bonus
+
+                    time_margin = req.hide_time - arrival_time_at_station
+                    margin_bonus = min(Config.WINDOW_BONUS_MAX, time_margin * 0.15)
+                    total_score += margin_bonus
+
+                elif arrival_time_at_station < req.creation_time:
+                    wait_time = req.creation_time - arrival_time_at_station
+                    total_score -= wait_time * Config.EARLY_PENALTY_RATE
+
+                else:
+                    total_score -= Config.LATE_PENALTY
+
+            simulated_time += Config.STOP_DURATION
+            visited_stations.add(to_st)
+
+            energy_efficiency = self.compute_energy_efficiency(from_st, to_st, len(self.logistic_units))  # 🚛 CHANGEMENT
+            total_score *= energy_efficiency
+
+            distance_penalty = Config.DIST_PENALTY * travel_duration * (1 + len(self.logistic_units)/self.capacity)  # 🚛 CHANGEMENT
+            total_score -= distance_penalty
+
+            for unit in self.logistic_units:  # 🚛 CHANGEMENT
+                if unit.arrival == to_st:
+                    total_score += 30
+
+        return total_score
+
+    # 🎯 VRP OPTIMISÉ avec heuristiques et élégage
+    def find_optimal_vrp_sequence(self, all_requests, current_time, horizon, other_trams=None):
+        """VRP OPTIMISÉ avec heuristiques et élégage"""
+        best_sequence = []
+        best_score = -9999
+
+        visible_requests = [
+            r for r in all_requests
+            if r.is_visible(current_time, horizon) and not r.is_expired(current_time) and r.status == "waiting"
+        ]
+
+        candidate_stations = self.select_intelligent_candidates(visible_requests, current_time, other_trams)
+
+        if not visible_requests and not self.logistic_units:  # 🚛 CHANGEMENT
+            if candidate_stations:
+                return [candidate_stations[0]], 0
+            else:
+                available = [s for s in range(Config.N_STATIONS) if s != self.position]
+                if available:
+                    return [random.choice(available)], 0
+                else:
+                    return [], 0
+
+        max_candidates = min(4, len(candidate_stations))
+        top_candidates = candidate_stations[:max_candidates]
+
+        sequences_to_evaluate = []
+
+        for station in top_candidates:
+            sequences_to_evaluate.append([station])
+
+        if len(top_candidates) >= 2:
+            for i, station1 in enumerate(top_candidates):
+                for station2 in top_candidates[i+1:]:
+                    sequences_to_evaluate.append([station1, station2])
+
+        if len(top_candidates) >= 3 and Config.VRP_LOOKAHEAD >= 3:
+            for i, station1 in enumerate(top_candidates):
+                for j, station2 in enumerate(top_candidates[i+1:]):
+                    for station3 in top_candidates[i+j+2:]:
+                        sequences_to_evaluate.append([station1, station2, station3])
+
+        evaluated_count = 0
+        for sequence in sequences_to_evaluate:
+            path = [self.position] + sequence
+            score = self.evaluate_path_with_time_windows(path, visible_requests, current_time, horizon, other_trams)
+
+            evaluated_count += 1
+
+            if score < -50:
+                continue
+
+            if score > best_score:
+                best_score = score
+                best_sequence = sequence
+
+        if not best_sequence and top_candidates:
+            best_sequence = [top_candidates[0]]
+            best_score = 0
+
+        if evaluated_count > 0:
+            print(f"  VRP: {evaluated_count} séquences évaluées → meilleure: {best_sequence} (score: {best_score:.1f})")
+
+        return best_sequence, best_score
+
+    # 🎯 Sélection intelligente des candidates
+    def select_intelligent_candidates(self, visible_requests, current_time, other_trams=None):
+        """Sélection OPTIMISÉE des stations candidates"""
+        all_stations = list(range(Config.N_STATIONS))
+        if self.position in all_stations:
+            all_stations.remove(self.position)
+
+        station_scores = []
+        for station in all_stations:
+            quick_score = self.compute_quick_station_score(station, current_time, visible_requests, other_trams)
+            station_scores.append((station, quick_score))
+
+        station_scores.sort(key=lambda x: x[1], reverse=True)
+
+        viable_candidates = [station for station, score in station_scores if score > -20]
+
+        return viable_candidates[:6]
+
+    def decide_route(self, all_requests, current_time, horizon, other_trams=None):
+        """Décision de route OPTIMISÉE"""
+        time_since_last_vrp = current_time - self.last_vrp_time
+        use_vrp = (time_since_last_vrp > 15) or not self.route
+
+        if use_vrp:
+            print(f"🚋 Tram {self.id} à station {self.position} → Lancement VRP (horizon: {horizon}min)")
+
+            best_sequence, vrp_score = self.find_optimal_vrp_sequence(all_requests, current_time, horizon, other_trams)
+
+            if best_sequence and vrp_score > -25:
+                self.route = best_sequence
+                self.last_vrp_time = current_time
+
+                horizon_type = "short_term" if horizon <= 30 else "medium_term" if horizon <= 90 else "long_term"
+                self.horizon_performance[horizon_type]["attempts"] += 1
+
+                print(f"  ✅ Nouvelle route: {self.route} (score: {vrp_score:.1f})")
+                return
+            else:
+                print(f"  ❌ Aucune bonne séquence VRP trouvée (meilleur score: {vrp_score:.1f})")
+
+        if not self.route:
+            self.apply_intelligent_fallback(all_requests, current_time, other_trams)
+
+    def apply_intelligent_fallback(self, all_requests, current_time, other_trams=None):
+        """Fallback intelligent optimisé"""
+        # 1. Priorité aux unités actuelles
+        if self.logistic_units:  # 🚛 CHANGEMENT
+            urgent_units = [u for u in self.logistic_units if u.get_urgency_score(current_time) > 4]
+            if urgent_units:
+                closest_urgent = min(urgent_units, key=lambda u: travel_time[self.position, u.arrival])
+                self.route = [closest_urgent.arrival]
+                print(f"  🎯 Fallback: Destination urgente {closest_urgent.arrival}")
+                return
+
+            closest_dest = min(self.logistic_units, key=lambda u: travel_time[self.position, u.arrival])
+            self.route = [closest_dest.arrival]
+            print(f"  🎯 Fallback: Destination proche {closest_dest.arrival}")
+            return
+
+        # 2. Station la plus prometteuse
+        available = [s for s in range(Config.N_STATIONS) if s != self.position]
+        if available:
+            scores = [(s, self.compute_quick_station_score(s, current_time,
+                     [r for r in all_requests if r.status == "waiting"], other_trams)) for s in available]
+            if scores:
+                best_station, best_score = max(scores, key=lambda x: x[1])
+                self.route = [best_station]
+                print(f"  🎯 Fallback: Meilleure station {best_station} (score: {best_score:.1f})")
+
+    def move_to_next_station(self):
+        if self.route:
+            next_station = self.route[0]
+            self.next_station = next_station
+            travel_duration = travel_time[self.position, next_station]
+            self.remaining_time = travel_duration
+            self.stats["total_distance"] += travel_duration
+            self.route = self.route[1:]
+
+    def complete_move(self):
+        if self.next_station is not None:
+            units_change = len(self.logistic_units)  # 🚛 CHANGEMENT
+            success_score = 1.0
+            self.record_movement(self.position, self.next_station, success_score, units_change)
+
+            self.position = self.next_station
+            self.next_station = None
+            self.waiting_time = Config.STOP_DURATION
+
+    # 📊 MÉTRIQUES D'EFFICACITÉ CORRIGÉES pour unités logistiques
+    def get_efficiency_metrics(self):
+        """Métriques d'efficacité CORRIGÉES pour unités logistiques"""
+        if self.stats["total_distance"] == 0:
+            return 0.0, 0.0, 0.0
+
+        # Conversion en kilomètres pour plus de sens
+        total_km = self.stats["total_distance"] / 1000
+
+        # 1. EFFICACITÉ D'OCCUPATION : unités transportées par km
+        occupation_efficiency = self.stats["units_served"] / total_km if total_km > 0 else 0
+
+        # 2. PRODUCTIVITÉ : unités × kilomètres (impact total)
+        productivity = self.stats["units_served"] * total_km
+
+        # 3. TAUX D'UTILISATION : % de la capacité théorique maximale utilisée
+        max_theoretical = self.capacity * total_km
+        capacity_utilization = self.stats["units_served"] / max_theoretical if max_theoretical > 0 else 0
+
+        return occupation_efficiency, productivity, capacity_utilization
+
+    # 🧠 MÉTHODES DE BASE adaptées aux unités logistiques
+    def drop_off(self, current_time):
+        """Débarquement des unités arrivées à destination"""
+        served = []
+        remaining_units = []
+
+        for unit in self.logistic_units:  # 🚛 CHANGEMENT
+            if unit.arrival == self.position:
+                unit.status = "served"
+                unit.arrived_time = current_time
+
+                if unit.arrival_deadline is not None:
+                    unit.delivered_late = current_time > unit.arrival_deadline
+
+                # 🚛 TOUJOURS units_served (plus de distinction passager/unité)
+                self.stats["units_served"] += 1
+
+                served.append(unit)
+            else:
+                remaining_units.append(unit)
+
+        self.logistic_units = remaining_units  # 🚛 CHANGEMENT
+        return served
+
+    def pick_up(self, station_requests, current_time):
+        """Embarquement des nouvelles demandes"""
+        onboarded = []
+        remaining_requests = []
+
+        for request in station_requests:
+            if (len(self.logistic_units) < self.capacity and  # 🚛 CHANGEMENT
+                request.departure == self.position and
+                request.status == "waiting" and
+                not request.is_expired(current_time)):
+
+                request.status = "onboard"
+                request.boarded_time = current_time
+                onboarded.append(request)
+                self.logistic_units.append(request)  # 🚛 CHANGEMENT
+            else:
+                remaining_requests.append(request)
+
+        return onboarded, remaining_requests
+
+# === Simulation OPTIMISÉE pour unités logistiques ===
+def run_advanced_simulation(horizon):
+    demand_predictor = DemandPredictor(Config.N_STATIONS)
+
+    # Réinitialisation
+    for req in all_requests:
+        req.status = "waiting"
+        req.arrived_time = None
+        req.delivered_late = False
+        req.boarded_time = None
+
+    trams = [
+        Tram(0, start_position=0, demand_predictor=demand_predictor),
+        Tram(1, start_position=3, demand_predictor=demand_predictor),
+    ]
+
+    stations = [[] for _ in range(Config.N_STATIONS)]
+    time = 0
+
+    urgency_stats = {
+        "immediate_served": 0, "immediate_lost": 0,
+        "near_served": 0, "near_lost": 0,
+        "far_served": 0, "far_lost": 0
+    }
+
+    # 📊 Métriques avancées CORRIGÉES
+    advanced_metrics = {
+        "occupation_efficiency": 0,    # unités/km
+        "productivity": 0,             # unités × km
+        "capacity_utilization": 0,     # % utilisation capacité
+        "collaboration_score": 0
+    }
+
+    while time < Config.SIM_DURATION:
+        # Nouvelles demandes avec priorité aléatoire
+        new_requests = [r for r in all_requests if r.creation_time == time and r.status == "waiting"]
+        for req in new_requests:
+            req.priority = random.uniform(0.8, 1.2)
+            stations[req.departure].append(req)
+
+        # Nettoyage des expirées
+        for station in stations:
+            remaining = []
+            for req in station:
+                if req.is_expired(time) and req.status == "waiting":
+                    req.status = "lost"
+                    urgency = req.get_urgency_level(time)
+                    urgency_stats[f"{urgency}_lost"] += 1
+                else:
+                    remaining.append(req)
+            station.clear()
+            station.extend(remaining)
+
+        # Mise à jour des trams avec collaboration
+        other_trams_list = [tram for tram in trams]
+
+        for tram in trams:
+            if tram.remaining_time > 0:
+                tram.remaining_time -= Config.TIME_STEP
+                if tram.remaining_time <= 0:
+                    tram.complete_move()
+                    served = tram.drop_off(time)
+
+                    for unit in served:  # 🚛 CHANGEMENT: unit au lieu de passenger
+                        horizon_type = "short_term" if horizon <= 30 else "medium_term" if horizon <= 90 else "long_term"
+                        tram.horizon_performance[horizon_type]["success"] += 1
+                        tram.horizon_performance[horizon_type]["recent_success"].append(1)
+
+                    onboarded, remaining = tram.pick_up(stations[tram.position], time)
+                    stations[tram.position] = remaining
+
+            elif tram.waiting_time > 0:
+                tram.waiting_time -= Config.TIME_STEP
+
+            else:
+                if not tram.route:
+                    other_trams = [t for t in trams if t.id != tram.id]
+                    tram.decide_route(all_requests, time, horizon, other_trams)
+                if tram.route:
+                    tram.move_to_next_station()
+
+        time += Config.TIME_STEP
+
+    # 📊 CALCUL DES MÉTRIQUES AVANCÉES CORRIGÉES
+    for tram in trams:
+        occupation_eff, productivity, capacity_util = tram.get_efficiency_metrics()
+        advanced_metrics["occupation_efficiency"] += occupation_eff
+        advanced_metrics["productivity"] += productivity
+        advanced_metrics["capacity_utilization"] += capacity_util
+
+    # Normalisation
+    advanced_metrics["occupation_efficiency"] /= len(trams)
+    advanced_metrics["capacity_utilization"] /= len(trams)
+    advanced_metrics["collaboration_score"] = calculate_collaboration_score(trams)
+
+    # Résultats standards (focus sur les unités logistiques)
+    logistic_units = [r for r in all_requests if r.type == "logistic_unit"]
+    served_on_time = 0
+    served_late = 0
+
+    for unit in logistic_units:
+        if unit.status == "served":
+            urgency = unit.get_urgency_level(unit.boarded_time if unit.boarded_time else unit.creation_time)
+            urgency_stats[f"{urgency}_served"] += 1
+
+            if not unit.delivered_late:
+                served_on_time += 1
+            else:
+                served_late += 1
+
+    lost = sum(1 for r in logistic_units if r.status == "lost")
+    total_served = served_on_time + served_late
+    success_rate = (total_served / len(logistic_units)) * 100 if logistic_units else 0
+    window_respect_rate = (served_on_time / total_served * 100) if total_served > 0 else 0
+
+    # 🚛 AFFICHAGE ADAPTÉ aux unités logistiques
+    print(f"Horizon {horizon:3d} min → {served_on_time:2d}⏱️, {served_late:2d}🚨, {lost:2d}❌ ({success_rate:5.1f}% ✅)")
+    print(f"         Fenêtres: {window_respect_rate:4.1f}% | Occupation: {advanced_metrics['occupation_efficiency']:.1f} unités/km")
+    print(f"         Productivité: {advanced_metrics['productivity']:.1f} unités-km | Utilisation: {advanced_metrics['capacity_utilization']:.1%}")
+
+    return {
+        "horizon": horizon,
+        "served_on_time": served_on_time,
+        "served_late": served_late,
+        "lost": lost,
+        "success_rate": success_rate,
+        "window_respect_rate": window_respect_rate,
+        "occupation_efficiency": advanced_metrics["occupation_efficiency"],
+        "productivity": advanced_metrics["productivity"],
+        "capacity_utilization": advanced_metrics["capacity_utilization"],
+        "collaboration": advanced_metrics["collaboration_score"]
+    }
+
+# 🤝 Calcul du score de collaboration
+def calculate_collaboration_score(trams):
+    """Calcule à quel point les trams évitent de se marcher sur les pieds"""
+    if len(trams) < 2:
+        return 1.0
+
+    total_stations = Config.N_STATIONS
+    station_coverage = set()
+
+    for tram in trams:
+        for movement in tram.movement_memory:
+            station_coverage.add(movement["to"])
+
+    coverage_rate = len(station_coverage) / total_stations
+    return coverage_rate
+
+# === CHARGEMENT ET EXÉCUTION ===
+print("🚛 SYSTÈME DE TRANSPORT LOGISTIQUE INTELLIGENT")
+print("=" * 80)
+
+# Chargement des données
+df = pd.read_csv("demandes_2A_0.csv")
+all_requests = []
+
+for _, row in df.iterrows():
+    req = TransportRequest(
+        row['type'],
+        int(row['departure']),
+        int(row['arrival']),
+        int(row['creation_time']),
+        int(row['hide_time']),
+        row.get('arrival_deadline')
+    )
+    all_requests.append(req)
+
+print(f"✅ {len(all_requests)} demandes chargées")
+print("🧠 Système optimisé pour UNITÉS LOGISTIQUES")
+print("🎯 VRP OPTIMISÉ avec métriques d'efficacité corrigées")
+
+# Exécution des simulations
+print("\n" + "=" * 80)
+print("SIMULATIONS AVEC SYSTÈME LOGISTIQUE AVANCÉ")
+print("=" * 80)
+
+horizons_to_test = [0, 15, 30, 45, 60]
+results = []
+
+for horizon in horizons_to_test:
+    results.append(run_advanced_simulation(horizon))
+
+# Analyse des résultats
+print("\n" + "=" * 80)
+print("ANALYSE COMPLÈTE DES PERFORMANCES LOGISTIQUES")
+print("=" * 80)
+print("Horizon | ⏱️À l'heure | 🚨En retard | ❌Perdus | ✅Taux | 🕒Fenêtres | 📦Occupation | 🔧Utilisation")
+print("-" * 100)
+
+best_result = max(results, key=lambda x: x['served_on_time'])
+
+for res in results:
+    highlight = " 🏆" if res == best_result else ""
+    print(f"{res['horizon']:7} | {res['served_on_time']:11} | {res['served_late']:10} | {res['lost']:8} | {res['success_rate']:5.1f}% | {res['window_respect_rate']:8.1f}% | {res['occupation_efficiency']:11.1f} | {res['capacity_utilization']:11.1%}{highlight}")
+
+print("\n" + "🚛 SYSTÈME LOGISTIQUE OPTIMISÉ - PERFORMANCES MAXIMISÉES!")
