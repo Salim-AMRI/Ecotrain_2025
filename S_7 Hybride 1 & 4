@@ -1,0 +1,207 @@
+import numpy as np
+import pandas as pd
+import random
+from collections import Counter
+
+# === 1. Configuration globale ===
+class Config:
+    N_STATIONS = 7
+    TRAM_CAPACITY = 50
+    SIM_DURATION = 900
+    TIME_STEP = 1
+    STOP_DURATION = 3
+    N_TRAMS = 1
+    FULL_RETURN_INTERVAL = 700  # toutes les 60 minutes, tram fait un aller-retour
+
+# === 2. Matrice des temps de trajet ===
+travel_time = np.array([
+    [  0,  10,  20,  35,  50,  60,  75],
+    [ 10,   0,  10,  25,  40,  50,  65],
+    [ 20,  10,   0,  15,  30,  40,  55],
+    [ 35,  25,  15,   0,  15,  25,  40],
+    [ 50,  40,  30,  15,   0,  10,  25],
+    [ 60,  50,  40,  25,  10,   0,  15],
+    [ 75,  65,  55,  40,  25,  15,   0],
+])
+
+# === 3. Classe TransportRequest ===
+class TransportRequest:
+    def __init__(self, req_type, departure, arrival, creation_time, hide_time, arrival_deadline=None):
+        self.type = req_type
+        self.departure = int(departure)
+        self.arrival = int(arrival)
+        self.time = int(creation_time)
+        self.hide_time = int(hide_time)
+        self.deadline = int(arrival_deadline) if arrival_deadline is not None else None
+        self.status = "waiting"
+        self.arrived_time = None
+        self.delivered_late = False
+
+    def direction(self):
+        return 1 if self.arrival > self.departure else -1 if self.arrival < self.departure else 0
+
+# === 4. Classe Tram ===
+class Tram:
+    def __init__(self, tram_id):
+        self.id = tram_id
+        self.position = 0
+        self.capacity = Config.TRAM_CAPACITY
+        self.passengers = []
+        self.destination = None
+        self.remaining_time = 0
+        self.waiting_time = 0
+        self.direction = 1
+        self.time_since_last_return = 0
+        self.returning = False
+
+    def drop_off(self, current_time):
+        served = [p for p in self.passengers if p.arrival == self.position]
+        for r in served:
+            r.status = "served"
+            r.arrived_time = current_time
+            r.delivered_late = (r.deadline is not None and r.arrived_time > r.deadline)
+        self.passengers = [p for p in self.passengers if p.arrival != self.position]
+        return served
+
+    def pick_up(self, waiting_list, current_time):
+        onboarded = []
+        remaining = []
+        for r in waiting_list:
+            if (len(self.passengers) < self.capacity
+                and r.departure == self.position
+                and r.status == "waiting"
+                and r.time <= current_time):
+                r.status = "onboard"
+                onboarded.append(r)
+                self.passengers.append(r)
+            else:
+                remaining.append(r)
+        return onboarded, remaining
+
+    def decide_next_station(self, waiting_requests):
+        if self.returning and self.destination is not None:
+            # destination déjà définie pour le retour
+            return self.direction
+        moves = []
+        if self.position > 0:
+            moves.append(-1)
+        if self.position < Config.N_STATIONS - 1:
+            moves.append(1)
+        move = random.choice(moves)
+        self.destination = self.position + move
+        self.direction = move
+        return self.direction
+
+    def move(self):
+        if self.destination is not None:
+            self.position = self.destination
+            self.destination = None
+
+# === 5. Chargement des demandes ===
+df = pd.read_csv("demandes_2A_0.csv")
+all_requests = []
+for _, row in df.iterrows():
+    arrival_deadline = row.get('arrival_deadline') if 'arrival_deadline' in row.index else None
+    req = TransportRequest(
+        row['type'],
+        row['departure'],
+        row['arrival'],
+        row['creation_time'],
+        row['hide_time'],
+        arrival_deadline
+    )
+    all_requests.append(req)
+
+Config.SIM_DURATION = max([r.deadline for r in all_requests]) + 20
+
+# === 6. Initialisation ===
+trams = [Tram(i) for i in range(Config.N_TRAMS)]
+time = 0
+waiting_requests = []
+future_requests = sorted(all_requests, key=lambda r: r.time)
+served_requests = []
+
+# === 7. Boucle principale ===
+while time < Config.SIM_DURATION:
+    # nouvelles demandes
+    new_requests = [r for r in future_requests if r.time == time]
+    if new_requests:
+        waiting_requests.extend(new_requests)
+        future_requests = [r for r in future_requests if r.time > time]
+
+    # gestion hide_time
+    for r in waiting_requests:
+        if r.status == "waiting" and time > r.hide_time:
+            r.status = "lost"
+
+    for tram in trams:
+        tram.time_since_last_return += Config.TIME_STEP
+
+        # déclenchement mode aller-retour
+        if tram.time_since_last_return >= Config.FULL_RETURN_INTERVAL and not tram.returning:
+            tram.returning = True
+            tram.time_since_last_return = 0
+            tram.destination = Config.N_STATIONS - 1 if tram.direction > 0 else 0
+            tram.remaining_time = int(travel_time[tram.position, tram.destination])
+            tram.direction = int(np.sign(tram.destination - tram.position))
+
+        # si le tram est en déplacement
+        if tram.remaining_time > 0:
+            tram.remaining_time -= Config.TIME_STEP
+            if tram.remaining_time <= 0:
+                tram.move()
+                served = tram.drop_off(time)
+                served_requests.extend(served)
+
+                # si en mode aller-retour, vérifier fin
+                if tram.returning:
+                    if tram.position == (Config.N_STATIONS - 1 if tram.direction > 0 else 0):
+                        tram.returning = False
+                    else:
+                        tram.remaining_time = int(travel_time[tram.position, tram.destination])
+                        tram.direction = int(np.sign(tram.destination - tram.position))
+                else:
+                    if tram.destination is None:
+                        tram.decide_next_station(waiting_requests)
+                    onboarded, remaining = tram.pick_up(waiting_requests, time)
+                    waiting_requests = remaining
+                    tram.waiting_time = Config.STOP_DURATION
+
+        # tram à l’arrêt
+        elif tram.waiting_time > 0:
+            tram.waiting_time -= Config.TIME_STEP
+
+        else:
+            if tram.destination is None:
+                tram.decide_next_station(waiting_requests)
+            if tram.destination is not None:
+                tram.remaining_time = int(travel_time[tram.position, tram.destination])
+                tram.direction = int(np.sign(tram.destination - tram.position))
+
+            # embarquement/débarquement classique
+            served = tram.drop_off(time)
+            served_requests.extend(served)
+            onboarded, remaining = tram.pick_up(waiting_requests, time)
+            waiting_requests = remaining
+            tram.waiting_time = Config.STOP_DURATION if onboarded else 0
+
+    time += Config.TIME_STEP
+
+# unités à bord restantes = perdues
+for tram in trams:
+    for r in tram.passengers:
+        if r.status == "onboard":
+            r.status = "lost"
+    tram.passengers = []
+
+# === 8. Bilan final ===
+final_status = Counter(req.status for req in all_requests)
+logistic_units_served_on_time = sum(1 for r in all_requests if r.type=="logistic_unit" and r.status=="served" and not r.delivered_late)
+logistic_units_late = sum(1 for r in all_requests if r.type=="logistic_unit" and r.status=="served" and r.delivered_late)
+logistic_units_lost = sum(1 for r in all_requests if r.type=="logistic_unit" and r.status=="lost")
+
+print(f"\n=== Bilan final pour {len(all_requests)} demandes ===")
+print(f"• Logistic_units servis à l'heure: {logistic_units_served_on_time}")
+print(f"• Logistic_units servis en retard: {logistic_units_late}")
+print(f"• Logistic_units perdus:           {logistic_units_lost}")
+print(f"-> Total demandes: {len(all_requests)}")
