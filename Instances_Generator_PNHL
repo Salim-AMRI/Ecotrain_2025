@@ -1,0 +1,90 @@
+import numpy as np
+import pandas as pd
+import random
+
+# === Matrice des temps de trajet entre les 7 gares (en minutes) ===
+travel_time = np.array([
+    [  0,  10,  20,  35,  50,  60,  75],
+    [ 10,   0,  10,  25,  40,  50,  65],
+    [ 20,  10,   0,  15,  30,  40,  55],
+    [ 35,  25,  15,   0,  15,  25,  40],
+    [ 50,  40,  30,  15,   0,  10,  25],
+    [ 60,  50,  40,  25,  10,   0,  15],
+    [ 75,  65,  55,  40,  25,  15,   0],
+])
+
+# === Paramètres ===
+STOP_DURATION = 3
+N_INSTANCES = 100
+N_STATIONS = 7
+T_MAX = 840   # 6h-20h
+
+# === Pics horaires corrects (minutes depuis 6h) ===
+PEAKS = [
+    (60, 180),   # 7h-9h
+    (660, 780),  # 17h-19h
+]
+
+# === Heures creuses ===
+OFF_PEAKS = [(0, 60), (180, 660), (780, T_MAX)]
+
+# === Fonction pour générer des demandes selon Poisson temporel ===
+def generate_poisson_demands(start, end, lambda_rate, max_demands=None):
+    demands = []
+    t = start
+    while t < end:
+        # intervalle exponentiel
+        delta_t = np.random.exponential(scale=1/lambda_rate)
+        t += delta_t
+        if t >= end:
+            break
+        if max_demands is not None and len(demands) >= max_demands:
+            break
+        t_int = int(t)
+        departure = random.randint(0, N_STATIONS - 1)
+        arrival = random.choice([i for i in range(N_STATIONS) if i != departure])
+        nombre_stations = abs(arrival - departure)
+        delta = STOP_DURATION * nombre_stations + random.randint(1, 5)
+        hide_time = t_int + random.randint(10, 30)
+        t_trajet = travel_time[departure][arrival]
+        predicted_arrival = hide_time + t_trajet
+        arrival_deadline = predicted_arrival + delta
+        # Contrôle temporel
+        if hide_time > T_MAX or predicted_arrival > T_MAX or arrival_deadline > T_MAX:
+            arrival_deadline = T_MAX - 1
+        demands.append({
+            "type": "logistic_unit",
+            "departure": departure,
+            "arrival": arrival,
+            "creation_time": t_int,
+            "hide_time": hide_time,
+            "predicted_arrival": predicted_arrival,
+            "arrival_deadline": arrival_deadline
+        })
+    return demands
+
+# === Génération des demandes totales ===
+data = []
+
+# 1️⃣ Générer d'abord les pics horaires avec λ élevé
+for start, end in PEAKS:
+    data.extend(generate_poisson_demands(start, end, lambda_rate=0.3))  # λ élevé pour pics
+
+# 2️⃣ Générer les heures creuses avec λ faible
+remaining = N_INSTANCES - len(data)
+while remaining > 0:
+    start, end = random.choice(OFF_PEAKS)
+    new_demands = generate_poisson_demands(start, end, lambda_rate=0.02, max_demands=remaining)
+    data.extend(new_demands)
+    remaining = N_INSTANCES - len(data)
+
+# Shuffle pour mélanger pics et creux
+random.shuffle(data)
+
+# Ne garder que N_INSTANCES exactes
+data = data[:N_INSTANCES]
+
+# Sauvegarde
+df = pd.DataFrame(data)
+df.to_csv("demandes_2AP_0.csv", index=False)
+print(f"{len(df)} demandes générées avec pics horaires bien visibles ✅")
