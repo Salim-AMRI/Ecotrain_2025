@@ -1,0 +1,221 @@
+import numpy as np
+import pandas as pd
+from collections import Counter
+
+# === Configuration ===
+class Config:
+    N_STATIONS = 7
+    TRAM_CAPACITY = 50
+    SIM_DURATION = 900
+    TIME_STEP = 1
+    STOP_DURATION = 3
+    N_RUNS = 30  # nombre de réplications
+
+# === Fonctions et classes ===
+class TransportRequest:
+    def __init__(self, req_type, departure, arrival, time):
+        self.type = req_type
+        self.departure = departure
+        self.arrival = arrival
+        self.time = time
+        self.deadline = None
+        self.arr_time = None
+        self.arr_deadline = None
+        self.status = "waiting"
+
+    def is_expired(self, current_time):
+        return self.deadline is not None and current_time > self.deadline
+
+def load_requests(csv_file):
+    df = pd.read_csv(csv_file)
+    requests = []
+    for _, row in df.iterrows():
+        req = TransportRequest(
+            row['type'],
+            int(row['departure']),
+            int(row['arrival']),
+            int(row['creation_time'])
+        )
+        req.deadline = int(row['hide_time'])
+        req.arr_time = int(row['predicted_arrival'])
+        req.arr_deadline = int(row['arrival_deadline'])
+        requests.append(req)
+    return requests
+
+# Matrice de temps de trajet
+travel_time = np.array([
+    [0,10,20,35,50,60,75],
+    [10,0,10,25,40,50,65],
+    [20,10,0,15,30,40,55],
+    [35,25,15,0,15,25,40],
+    [50,40,30,15,0,10,25],
+    [60,50,40,25,10,0,15],
+    [75,65,55,40,25,15,0]
+])
+
+# === Fonction de simulation pour un run ===
+def run_simulation(seed=None):
+    np.random.seed(seed)
+
+    all_requests = load_requests(DEMANDS_FILE)
+    Config.SIM_DURATION = max(req.arr_deadline for req in all_requests) + 20
+
+    # Initialisation
+    stations = [[] for _ in range(Config.N_STATIONS)]
+    station_stats = {i: {'served':0, 'lost':0, 'late':0} for i in range(Config.N_STATIONS)}
+    tram = {"position":0, "direction":1, "onboard":[], "capacity":Config.TRAM_CAPACITY,
+            "stop_timer":0, "travel_timer":0, "next_position":None}
+    stats = {"passengers":{"total":0,"served":0,"lost":0},
+             "logistic_units":{"total":0,"served":0,"lost":0,"late":0}}
+    time_stats = {"time":[],"passengers":{"total":[],"served":[],"lost":[]},
+                  "logistic_units":{"total":[],"served":[],"lost":[],"late":[]},
+                  "occupation":[]}
+
+    def update_stats():
+        for key in ["passengers","logistic_units"]:
+            for subkey in ["total","served","lost"]:
+                time_stats[key][subkey].append(stats[key][subkey])
+        time_stats["logistic_units"]["late"].append(stats["logistic_units"]["late"])
+        time_stats["occupation"].append(len(tram["onboard"])/Config.TRAM_CAPACITY)
+
+    def update(frame):
+        current_time = frame * Config.TIME_STEP
+        time_stats["time"].append(current_time)
+
+        # Arrivée nouvelles demandes
+        for req in all_requests:
+            if req.time == current_time:
+                stations[req.departure].append(req)
+                key = "passengers" if req.type=="passenger" else "logistic_units"
+                stats[key]["total"] += 1
+
+        # Expiration
+        for i in range(Config.N_STATIONS):
+            remaining_requests = []
+            for req in stations[i]:
+                if req.status=="waiting" and req.is_expired(current_time):
+                    req.status="lost"
+                    key = "passengers" if req.type=="passenger" else "logistic_units"
+                    stats[key]["lost"] += 1
+                    station_stats[i]['lost'] += 1
+                else:
+                    remaining_requests.append(req)
+            stations[i] = remaining_requests
+
+        pos = tram["position"]
+
+        # Déplacement
+        if tram["travel_timer"]>0:
+            tram["travel_timer"]-=1
+            if tram["travel_timer"]==0:
+                tram["position"]=tram["next_position"]
+                tram["next_position"]=None
+            else:
+                update_stats()
+                return
+
+        # Arrêt
+        if tram["stop_timer"]>0:
+            tram["stop_timer"]-=1
+        else:
+            remaining=[]
+            for req in tram["onboard"]:
+                if req.arrival==pos:
+                    if req.type=="passenger":
+                        if current_time>req.arr_deadline:
+                            req.status="lost"
+                            stats["passengers"]["lost"]+=1
+                            station_stats[pos]["lost"]+=1
+                        else:
+                            req.status="served"
+                            stats["passengers"]["served"]+=1
+                            station_stats[pos]["served"]+=1
+                        tram["capacity"]+=1
+                    else:
+                        if current_time>req.arr_deadline:
+                            req.status="served_late"
+                            stats["logistic_units"]["late"]+=1
+                            station_stats[pos]["late"]+=1
+                        else:
+                            req.status="served"
+                            stats["logistic_units"]["served"]+=1
+                            station_stats[pos]["served"]+=1
+                        tram["capacity"]+=0.5
+                    tram["stop_timer"]+=Config.STOP_DURATION
+                else:
+                    remaining.append(req)
+            tram["onboard"]=remaining
+
+            # Embarquement
+            for req in stations[pos]:
+                if req.status!="waiting":
+                    continue
+                if req.is_expired(current_time):
+                    req.status="lost"
+                    stats[f"{req.type}s"]["lost"]+=1
+                    station_stats[pos]["lost"]+=1
+                    continue
+                size=1 if req.type=="passenger" else 0.5
+                dir_ok = (req.arrival-pos)*tram["direction"]>0
+                if dir_ok and tram["capacity"]>=size:
+                    req.status="onboard"
+                    tram["onboard"].append(req)
+                    tram["capacity"]-=size
+                    tram["stop_timer"]+=Config.STOP_DURATION
+
+            stations[pos] = [req for req in stations[pos] if req.status=="waiting"]
+
+            # Prochaine station
+            if tram["stop_timer"]==0:
+                next_pos = pos + tram["direction"]
+                if next_pos<0 or next_pos>=Config.N_STATIONS:
+                    tram["direction"]*=-1
+                    next_pos = pos + tram["direction"]
+                tram["travel_timer"]=travel_time[pos,next_pos]
+                tram["next_position"]=next_pos
+
+        update_stats()
+
+    # Boucle de simulation
+    for t in range(Config.SIM_DURATION // Config.TIME_STEP):
+        update(t)
+
+    # Retourner résultats du run
+    return {
+        "ul_servis_on_time": stats["logistic_units"]["served"],
+        "ul_servis_late": stats["logistic_units"]["late"],
+        "ul_perdus": stats["logistic_units"]["lost"],
+        "ul_servis": stats["logistic_units"]["served"] + stats["logistic_units"]["late"],
+        #"passagers_servis": stats["passengers"]["served"],
+        #"transferts_centrale": 0,  # si applicable
+        "taux_succes": 100 * (stats["logistic_units"]["served"] + stats["logistic_units"]["late"]) / (stats["logistic_units"]["served"] + stats["logistic_units"]["late"] + stats["logistic_units"]["lost"])
+    }
+
+# === Exécution des 30 runs et sauvegarde Excel ===
+
+OUTPUT_FILE = "simulation_results_S1_demandes_2AP_8.xlsx"
+DEMANDS_FILE = "demandes_2AP_8.csv"
+
+results = []
+for run in range(Config.N_RUNS):
+    res = run_simulation(seed=run)
+    results.append(res)
+    print(f"✅ Run {run+1}/{Config.N_RUNS} terminé")
+
+df = pd.DataFrame(results)
+summary = df.agg(['mean','std'])
+summary.loc['ci95_inf'] = summary.loc['mean'] - (1.96*summary.loc['std']/np.sqrt(Config.N_RUNS))
+summary.loc['ci95_sup'] = summary.loc['mean'] + (1.96*summary.loc['std']/np.sqrt(Config.N_RUNS))
+
+with pd.ExcelWriter(OUTPUT_FILE) as writer:
+    df.to_excel(writer, sheet_name="Runs", index=False)
+    summary.to_excel(writer, sheet_name="Summary")
+
+print("="*60)
+print(f"✅ Résultats sauvegardés dans {OUTPUT_FILE}")
+print("\n📊 RÉSULTATS MOYENS SUR 30 RUNS (STRATÉGIE CENTRALE)")
+print("="*60)
+for col in ['ul_servis_on_time','ul_servis_late','ul_servis','ul_perdus','taux_succes']:
+    mean = df[col].mean()
+    ci = 1.96*df[col].std()/np.sqrt(Config.N_RUNS)
+    print(f"• {col.replace('_',' ')} : {mean:.1f} ± {ci:.1f}")
