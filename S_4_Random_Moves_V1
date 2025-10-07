@@ -1,0 +1,179 @@
+import numpy as np
+import pandas as pd
+import random
+from collections import Counter
+
+# === Configuration globale ===
+class Config:
+    N_STATIONS = 7
+    TRAM_CAPACITY = 50
+    SIM_DURATION = 900   # durée totale (minutes)
+    TIME_STEP = 1
+    STOP_DURATION = 3
+    N_TRAMS = 1
+
+# === Matrice des temps de trajet entre stations (minutes) ===
+travel_time = np.array([
+    [  0,  10,  20,  35,  50,  60,  75],
+    [ 10,   0,  10,  25,  40,  50,  65],
+    [ 20,  10,   0,  15,  30,  40,  55],
+    [ 35,  25,  15,   0,  15,  25,  40],
+    [ 50,  40,  30,  15,   0,  10,  25],
+    [ 60,  50,  40,  25,  10,   0,  15],
+    [ 75,  65,  55,  40,  25,  15,   0],
+])
+
+# === Classe pour modéliser une demande de transport ===
+class TransportRequest:
+    def __init__(self, req_type, departure, arrival, creation_time, hide_time, arrival_deadline=None):
+        self.type = req_type
+        self.departure = int(departure)
+        self.arrival = int(arrival)
+        self.time = int(creation_time)
+        self.hide_time = int(hide_time)
+        self.deadline = int(arrival_deadline) if arrival_deadline is not None else None
+        self.status = "waiting"
+        self.arrived_time = None
+        self.delivered_late = False
+
+    def direction(self):
+        if self.arrival > self.departure:
+            return 1
+        elif self.arrival < self.departure:
+            return -1
+        else:
+            return 0
+
+# === Classe modélisant un tramway ===
+class Tram:
+    def __init__(self, tram_id):
+        self.id = tram_id
+        self.position = 0
+        self.capacity = Config.TRAM_CAPACITY
+        self.passengers = []
+        self.destination = None
+        self.remaining_time = 0
+        self.waiting_time = 0
+        self.direction = None
+
+    def drop_off(self, current_time):
+        served = [p for p in self.passengers if p.arrival == self.position]
+        for r in served:
+            r.status = "served"
+            r.arrived_time = current_time
+            r.delivered_late = (r.deadline is not None and r.arrived_time > r.deadline)
+        self.passengers = [p for p in self.passengers if p.arrival != self.position]
+        return served
+
+    def pick_up(self, waiting_list, current_time):
+        onboarded = []
+        remaining = []
+        for r in waiting_list:
+            if (len(self.passengers) < self.capacity
+                and r.departure == self.position
+                and r.status == "waiting"
+                and r.time <= current_time):
+                r.status = "onboard"
+                onboarded.append(r)
+                self.passengers.append(r)
+            else:
+                remaining.append(r)
+        return onboarded, remaining
+
+    def decide_next_station(self, waiting_requests):
+        moves = []
+        if self.position > 0:
+            moves.append(-1)
+        if self.position < Config.N_STATIONS - 1:
+            moves.append(1)
+        move = random.choice(moves)
+        self.destination = self.position + move
+        self.direction = move
+        return self.direction
+
+    def move(self):
+        self.position = self.destination
+        self.destination = None
+
+# === Chargement des demandes ===
+df = pd.read_csv("demandes_2A_0.csv")
+all_requests = []
+for _, row in df.iterrows():
+    arrival_deadline = row.get('arrival_deadline') if 'arrival_deadline' in row.index else None
+    req = TransportRequest(
+        row['type'],
+        int(row['departure']),
+        int(row['arrival']),
+        int(row['creation_time']),
+        int(row['hide_time']),
+        arrival_deadline
+    )
+    all_requests.append(req)
+
+# === Vérification des demandes invalides ===
+invalid_requests = [r for r in all_requests if r.departure < 0 or r.departure >= Config.N_STATIONS or r.arrival < 0 or r.arrival >= Config.N_STATIONS]
+if invalid_requests:
+    print("Attention : Certaines demandes ont des stations invalides !")
+
+# === Initialisation de la simulation ===
+trams = [Tram(i) for i in range(Config.N_TRAMS)]
+time = 0
+waiting_requests = []
+future_requests = sorted(all_requests, key=lambda r: r.time)
+served_requests = []
+
+# === Boucle principale ===
+while time < Config.SIM_DURATION:
+    new_requests = [r for r in future_requests if r.time == time]
+    if new_requests:
+        waiting_requests.extend(new_requests)
+        future_requests = [r for r in future_requests if r.time > time]
+
+    # Gestion hide_time
+    for r in waiting_requests:
+        if r.status == "waiting" and time > r.hide_time:
+            r.status = "lost"
+
+    # Gestion trams
+    for tram in trams:
+        if tram.remaining_time > 0:
+            tram.remaining_time -= Config.TIME_STEP
+            if tram.remaining_time == 0:
+                tram.move()
+                served = tram.drop_off(time)
+                served_requests.extend(served)
+                if tram.destination is None:
+                    tram.decide_next_station(waiting_requests)
+                onboarded, remaining = tram.pick_up(waiting_requests, time)
+                waiting_requests = remaining
+                tram.waiting_time = Config.STOP_DURATION
+        elif tram.waiting_time > 0:
+            tram.waiting_time -= Config.TIME_STEP
+        else:
+            if tram.destination is None:
+                tram.decide_next_station(waiting_requests)
+            tram.remaining_time = travel_time[tram.position, tram.destination]
+
+    time += Config.TIME_STEP
+
+# --- Traiter unités à bord comme perdues ---
+for tram in trams:
+    for r in tram.passengers:
+        if r.status == "onboard":
+            r.status = "lost"
+    tram.passengers = []
+
+# === Bilan final ===
+final_status = Counter(req.status for req in all_requests)
+print(f"\n=== Bilan final pour {len(all_requests)} demandes ===")
+logistic_units_served_on_time = sum(1 for r in all_requests if r.type == "logistic_unit" and r.status == "served" and not r.delivered_late)
+logistic_units_late = sum(1 for r in all_requests if r.type == "logistic_unit" and r.status == "served" and r.delivered_late)
+logistic_units_lost = sum(1 for r in all_requests if r.type == "logistic_unit" and r.status == "lost")
+waiting_count = final_status.get('waiting', 0)
+onboard_count = sum(len(tram.passengers) for tram in trams)
+
+print(f"• Logistic_units servis à l'heure: {logistic_units_served_on_time}")
+print(f"• Logistic_units servis en retard: {logistic_units_late}")
+print(f"• Logistic_units perdus:           {logistic_units_lost}")
+#print(f"• En attente: {waiting_count}")
+#print(f"• À bord:     {onboard_count}")
