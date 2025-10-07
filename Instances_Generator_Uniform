@@ -1,0 +1,57 @@
+import numpy as np
+import pandas as pd
+import random
+
+# === Matrice des temps de trajet entre les 7 gares (en minutes) ===
+# [Agen, Layrac, Astaffort, Lectoure, Fleurance, Preignan, Auch]
+# (Ces durées sont approximatives, ajustables selon les données réelles)
+travel_time = np.array([
+    [  0,  10,  20,  35,  50,  60,  75],  # Agen
+    [ 10,   0,  10,  25,  40,  50,  65],  # Layrac
+    [ 20,  10,   0,  15,  30,  40,  55],  # Astaffort
+    [ 35,  25,  15,   0,  15,  25,  40],  # Lectoure
+    [ 50,  40,  30,  15,   0,  10,  25],  # Fleurance
+    [ 60,  50,  40,  25,  10,   0,  15],  # Preignan
+    [ 75,  65,  55,  40,  25,  15,   0],  # Auch
+])
+
+# === Paramètres ===
+STOP_DURATION = 3  # en minutes
+N_INSTANCES = 100
+N_STATIONS = 7
+T_MAX = 840  # 14 heures = 6h à 20h
+
+data = []
+
+for _ in range(N_INSTANCES):
+    req_type = 'logistic_unit'
+    departure = random.randint(0, N_STATIONS - 1)
+    arrival = random.choice([i for i in range(N_STATIONS) if i != departure])
+
+    nombre_stations = abs(arrival - departure)
+    delta = STOP_DURATION * nombre_stations + random.randint(1, 5)
+
+    while True:
+        creation_time = random.randint(0, T_MAX - 50)
+        hide_time = creation_time + random.randint(10, 30)
+
+        t_trajet = travel_time[departure][arrival]
+        predicted_arrival = hide_time + t_trajet
+        arrival_deadline = predicted_arrival + delta
+
+        if arrival_deadline <= T_MAX:
+            break
+
+    data.append({
+        'type': req_type,
+        'departure': departure,
+        'arrival': arrival,
+        'creation_time': creation_time,
+        'hide_time': hide_time,
+        'predicted_arrival': predicted_arrival,
+        'arrival_deadline': arrival_deadline,
+    })
+
+df = pd.DataFrame(data)
+df.to_csv('demandes_2A_9.csv', index=False)
+#df.to_csv('demandes_agen_auch.csv', index=False)
