@@ -1,0 +1,210 @@
+import numpy as np
+import random
+from collections import Counter
+import pandas as pd
+
+# === Configuration ===
+class Config:
+    N_STATIONS = 7
+    TRAM_CAPACITY = 50           # capacité = 50 passagers ou équivalent
+    SIM_DURATION = 900           # sera ajustée après lecture du CSV
+    TIME_STEP = 1                # pas de simulation en minutes
+    STOP_DURATION = 3            # temps d'arrêt pour embarquement/débarquement
+    DELAY_RANGE = (5, 20)        # non utilisé ici, mais peut servir pour bruit aléatoire
+
+# === 1. Matrice travel_time ===
+travel_time = np.array([
+    [  0,  10,  20,  35,  50,  60,  75],  # Agen
+    [ 10,   0,  10,  25,  40,  50,  65],  # Layrac
+    [ 20,  10,   0,  15,  30,  40,  55],  # Astaffort
+    [ 35,  25,  15,   0,  15,  25,  40],  # Lectoure
+    [ 50,  40,  30,  15,   0,  10,  25],  # Fleurance
+    [ 60,  50,  40,  25,  10,   0,  15],  # Preignan
+    [ 75,  65,  55,  40,  25,  15,   0],  # Auch
+])
+
+# === 2. Classe TransportRequest ===
+class TransportRequest:
+    def __init__(self, req_type, departure, arrival, time):
+        self.type = req_type                  # "passenger" ou "logistic_unit"
+        self.departure = departure
+        self.arrival = arrival
+        self.time = time                      # instant d'apparition
+        self.deadline = None                  # hide_time = disparition si non pris en charge
+        self.arr_time = None                  # predicted arrival (non critique ici)
+        self.arr_deadline = None              # dernier délai d'arrivée
+        self.status = "waiting"
+
+    def is_expired(self, current_time):
+        return self.deadline is not None and current_time > self.deadline
+
+# === 3. Chargement des demandes depuis CSV ===
+def load_requests(csv_file):
+    df = pd.read_csv(csv_file)
+    requests = []
+    for _, row in df.iterrows():
+        req = TransportRequest(
+            row['type'],
+            int(row['departure']),
+            int(row['arrival']),
+            int(row['creation_time'])
+        )
+        req.deadline = int(row['hide_time'])
+        req.arr_time = int(row['predicted_arrival'])
+        req.arr_deadline = int(row['arrival_deadline'])
+        requests.append(req)
+    return requests
+
+all_requests = load_requests('demandes_2A_0.csv')
+Config.SIM_DURATION = max(req.arr_deadline for req in all_requests) + 20
+
+# === 4. Initialisation ===
+stations = [[] for _ in range(Config.N_STATIONS)]
+station_stats = {i: {'served':0, 'lost':0, 'late':0} for i in range(Config.N_STATIONS)}
+
+tram = {
+    "position": 0,
+    "direction": 1,
+    "onboard": [],
+    "capacity": Config.TRAM_CAPACITY,
+    "stop_timer": 0,
+    "travel_timer": 0,
+    "next_position": None
+}
+
+stats = {
+    "passengers": {"total":0, "served":0, "lost":0},
+    "logistic_units": {"total":0, "served":0, "lost":0, "late":0}
+}
+
+time_stats = {
+    "time": [],
+    "passengers": {"total":[], "served":[], "lost":[]},
+    "logistic_units": {"total":[], "served":[], "lost":[], "late":[]},
+    "occupation": []
+}
+
+# === 5. Fonction update ===
+def update(frame):
+    current_time = frame * Config.TIME_STEP
+    time_stats["time"].append(current_time)
+
+    # Arrivée des nouvelles demandes
+    for req in all_requests:
+        if req.time == current_time:
+            stations[req.departure].append(req)
+            key = "passengers" if req.type == "passenger" else "logistic_units"
+            stats[key]["total"] += 1
+
+    # Vérification périodique des expirations
+    for i in range(Config.N_STATIONS):
+        remaining_requests = []
+        for req in stations[i]:
+            if req.status == "waiting" and req.is_expired(current_time):
+                req.status = "lost"
+                key = "passengers" if req.type == "passenger" else "logistic_units"
+                stats[key]["lost"] += 1
+                station_stats[i]['lost'] += 1
+            else:
+                remaining_requests.append(req)
+        stations[i] = remaining_requests
+
+    pos = tram["position"]
+
+    # Si le tram est en déplacement
+    if tram["travel_timer"] > 0:
+        tram["travel_timer"] -= 1
+        if tram["travel_timer"] == 0:
+            tram["position"] = tram["next_position"]
+            tram["next_position"] = None
+        else:
+            update_stats()
+            return
+
+    # Si le tram est en arrêt
+    if tram["stop_timer"] > 0:
+        tram["stop_timer"] -= 1
+    else:
+        # Débarquement
+        remaining = []
+        for req in tram["onboard"]:
+            if req.arrival == pos:
+                if req.type == "passenger":
+                    if current_time > req.arr_deadline:
+                        req.status = "lost"
+                        stats["passengers"]["lost"] += 1
+                        station_stats[pos]["lost"] += 1
+                    else:
+                        req.status = "served"
+                        stats["passengers"]["served"] += 1
+                        station_stats[pos]['served'] += 1
+                    tram["capacity"] += 1
+                else:  # colis
+                    if current_time > req.arr_deadline:
+                        req.status = "served_late"
+                        stats["logistic_units"]["late"] += 1
+                        station_stats[pos]["late"] += 1
+                    else:
+                        req.status = "served"
+                        stats["logistic_units"]["served"] += 1
+                        station_stats[pos]['served'] += 1
+                    tram["capacity"] += 0.5
+                tram["stop_timer"] += Config.STOP_DURATION
+            else:
+                remaining.append(req)
+        tram["onboard"] = remaining
+
+        # Embarquement
+        for req in stations[pos]:
+            if req.status != "waiting":
+                continue
+            if req.is_expired(current_time):
+                req.status = "lost"
+                stats[f"{req.type}s"]["lost"] += 1
+                station_stats[pos]['lost'] += 1
+                continue
+            size = 1 if req.type == "passenger" else 0.5
+            dir_ok = (req.arrival - pos) * tram["direction"] > 0
+            if dir_ok and tram["capacity"] >= size:
+                req.status = "onboard"
+                tram["onboard"].append(req)
+                tram["capacity"] -= size
+                tram["stop_timer"] += Config.STOP_DURATION
+
+        stations[pos] = [req for req in stations[pos] if req.status == "waiting"]
+
+        # Départ vers la prochaine station
+        if tram["stop_timer"] == 0:
+            next_pos = pos + tram["direction"]
+            if next_pos < 0 or next_pos >= Config.N_STATIONS:
+                tram["direction"] *= -1
+                next_pos = pos + tram["direction"]
+            travel_duration = travel_time[pos, next_pos]
+            tram["travel_timer"] = travel_duration
+            tram["next_position"] = next_pos
+
+    update_stats()
+
+def update_stats():
+    for key in ["passengers", "logistic_units"]:
+        for subkey in ["total", "served", "lost"]:
+            time_stats[key][subkey].append(stats[key][subkey])
+    time_stats["logistic_units"]["late"].append(stats["logistic_units"]["late"])
+    time_stats["occupation"].append(len(tram["onboard"]) / Config.TRAM_CAPACITY)
+
+# === 6. Simulation (au lieu de l'animation) ===
+for t in range(Config.SIM_DURATION // Config.TIME_STEP):
+    update(t)
+
+# === 7. Bilan final ===
+final_status = Counter(req.status for req in all_requests)
+print(f"\n=== Bilan final pour {len(all_requests)} demandes ===")
+#print(f"• Passagers servis: {stats['passengers']['served']}")
+#print(f"• Passagers perdus: {stats['passengers']['lost']}")
+print(f"• UL servis à l'heure: {stats['logistic_units']['served']}")
+print(f"• UL servis en retard: {stats['logistic_units']['late']}")
+print(f"• UL servis: {stats['logistic_units']['served'] + stats['logistic_units']['late']}")
+print(f"• UL perdus: {stats['logistic_units']['lost']}")
+#print(f"• En attente: {final_status.get('waiting', 0)}")
+#print(f"• À bord: {final_status.get('onboard', 0)}")
+print(f"-> Total demandes: {len(all_requests)}")
