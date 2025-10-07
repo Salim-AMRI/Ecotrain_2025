@@ -1,0 +1,252 @@
+import numpy as np
+import pandas as pd
+
+# === Configuration ===
+class Config:
+    N_STATIONS = 7
+    TRAM_CAPACITY = 50
+    SIM_DURATION = 900
+    TIME_STEP = 1
+    STOP_DURATION = 3
+    N_RUNS = 30  # nombre de réplications
+
+# === Matrice travel_time ===
+travel_time = np.array([
+    [  0,  10,  20,  35,  50,  60,  75],
+    [ 10,   0,  10,  25,  40,  50,  65],
+    [ 20,  10,   0,  15,  30,  40,  55],
+    [ 35,  25,  15,   0,  15,  25,  40],
+    [ 50,  40,  30,  15,   0,  10,  25],
+    [ 60,  50,  40,  25,  10,  0,  15],
+    [ 75,  65,  55,  40,  25,  15,  0],
+])
+
+# === Classe TransportRequest ===
+class TransportRequest:
+    def __init__(self, req_type, departure, arrival, creation_time, hide_time, arrival_deadline):
+        self.type = req_type
+        self.departure = int(departure)
+        self.arrival = int(arrival)
+        self.creation_time = int(creation_time)
+        self.hide_time = int(hide_time)
+        self.arrival_deadline = int(arrival_deadline)
+        self.status = "waiting"
+        self.delivered_late = False
+        self.arr_time = None
+        self.current_leg = 0
+        self.has_been_counted = False
+        if departure <= arrival:
+            self.path = list(range(departure, arrival + 1))
+        else:
+            self.path = list(range(departure, arrival - 1, -1))
+        self.legs = [(self.path[i], self.path[i+1]) for i in range(len(self.path)-1)]
+
+    def is_in_time_window(self, current_time):
+        return self.creation_time <= current_time <= self.hide_time
+
+    def current_segment(self):
+        if self.current_leg < len(self.legs):
+            return self.legs[self.current_leg]
+        return None
+
+    def next_station(self):
+        if self.current_leg < len(self.legs):
+            return self.legs[self.current_leg][1]
+        return self.arrival
+
+    def should_disembark(self, current_station):
+        return current_station == self.next_station()
+
+# === Fonction de simulation ===
+def run_simulation(seed=None):
+    if seed is not None:
+        np.random.seed(seed)
+
+    # Chargement des demandes
+    df = pd.read_csv(DEMANDS_FILE)
+    all_requests = []
+    for _, row in df.iterrows():
+        req = TransportRequest(row['type'], row['departure'], row['arrival'],
+                               row['creation_time'], row['hide_time'], row['arrival_deadline'])
+        all_requests.append(req)
+
+    stations = [[] for _ in range(Config.N_STATIONS)]
+    station_stats = {i: {'served_on_time':0, 'served_late':0, 'lost':0, 'transfers':0} for i in range(Config.N_STATIONS)}
+
+    trams = []
+    for i in range(Config.N_STATIONS-1):
+        trams.append({
+            "id": i,
+            "position": i,
+            "direction": 1,
+            "onboard": [],
+            "capacity": Config.TRAM_CAPACITY,
+            "stop_timer": 0,
+            "travel_timer": 0,
+            "next_position": None,
+            "range": range(i, i+2)
+        })
+
+    stats = {
+        "passenger": {"total":0, "served_on_time":0, "served_late":0, "lost":0},
+        "logistic_unit": {"total":0, "served_on_time":0, "served_late":0, "lost":0}
+    }
+
+    for current_time in range(Config.SIM_DURATION):
+
+        for req in all_requests:
+            if req.creation_time == current_time and req.status == "waiting":
+                stations[req.departure].append(req)
+                stats[req.type]["total"] += 1
+
+        for tram in trams:
+            pos = tram["position"]
+
+            if tram["travel_timer"] > 0:
+                tram["travel_timer"] -= 1
+                if tram["travel_timer"] == 0 and tram["next_position"] is not None:
+                    tram["position"] = tram["next_position"]
+                    tram["next_position"] = None
+                    tram["stop_timer"] = Config.STOP_DURATION
+                continue
+
+            if tram["stop_timer"] > 0:
+                tram["stop_timer"] -= 1
+                if tram["stop_timer"] == 0:
+                    remaining_onboard = []
+                    transfers = []
+                    for req in tram["onboard"]:
+                        if req.should_disembark(pos):
+                            if req.current_leg == len(req.legs) - 1:
+                                if not req.has_been_counted:
+                                    req.status = "served"
+                                    req.arr_time = current_time
+                                    req.has_been_counted = True
+                                    if current_time > req.arrival_deadline:
+                                        req.delivered_late = True
+                                        stats[req.type]["served_late"] += 1
+                                        station_stats[pos]['served_late'] += 1
+                                    else:
+                                        stats[req.type]["served_on_time"] += 1
+                                        station_stats[pos]['served_on_time'] += 1
+                            else:
+                                req.status = "transfer"
+                                req.current_leg += 1
+                                transfers.append(req)
+                                station_stats[pos]['transfers'] += 1
+                        else:
+                            remaining_onboard.append(req)
+                    tram["onboard"] = remaining_onboard
+                    if transfers:
+                        stations[pos].extend(transfers)
+                continue
+
+            new_queue = []
+            for req in stations[pos]:
+                if req.status == "waiting":
+                    if not req.is_in_time_window(current_time):
+                        req.status = "lost"
+                        if not req.has_been_counted:
+                            stats[req.type]["lost"] += 1
+                            station_stats[pos]['lost'] += 1
+                            req.has_been_counted = True
+                        continue
+                seg = req.current_segment()
+                if seg is None:
+                    new_queue.append(req)
+                    continue
+
+                tram_stations = set(tram["range"])
+                size = 1.0 if req.type == "passenger" else 0.5
+
+                if (seg[0] in tram_stations and seg[1] in tram_stations and tram["capacity"] >= size):
+                    req.status = "onboard"
+                    tram["onboard"].append(req)
+                    tram["capacity"] -= size
+                    tram["stop_timer"] = Config.STOP_DURATION
+                else:
+                    new_queue.append(req)
+            stations[pos] = new_queue
+
+            if tram["stop_timer"] == 0 and tram["travel_timer"] == 0:
+                nxt = pos + tram["direction"]
+                if nxt not in tram["range"]:
+                    tram["direction"] *= -1
+                    nxt = pos + tram["direction"]
+                tram["next_position"] = nxt
+                tram["travel_timer"] = travel_time[pos][nxt]
+
+    # Débarquement final
+    for tram in trams:
+        pos = tram["position"]
+        for req in tram["onboard"]:
+            if not req.has_been_counted:
+                req.status = "served"
+                req.arr_time = Config.SIM_DURATION - 1
+                req.has_been_counted = True
+                if Config.SIM_DURATION - 1 > req.arrival_deadline:
+                    req.delivered_late = True
+                    stats[req.type]["served_late"] += 1
+                    station_stats[pos]['served_late'] += 1
+                else:
+                    stats[req.type]["served_on_time"] += 1
+                    station_stats[pos]['served_on_time'] += 1
+
+    for pos, station_requests in enumerate(stations):
+        for req in station_requests:
+            if not req.has_been_counted and req.status in ("waiting", "transfer"):
+                req.status = "lost"
+                stats[req.type]["lost"] += 1
+                station_stats[pos]['lost'] += 1
+                req.has_been_counted = True
+
+    # Retourne un dictionnaire des indicateurs
+    total_served_on_time_ul = stats['logistic_unit']['served_on_time']
+    total_served_late_ul = stats['logistic_unit']['served_late']
+    total_lost_ul = stats['logistic_unit']['lost']
+    total_served_ul = stats['logistic_unit']['served_on_time'] + stats['logistic_unit']['served_late']
+    #total_served_passenger = stats['passenger']['served_on_time'] + stats['passenger']['served_late']
+    total_transfers = sum(station_stats[s]['transfers'] for s in station_stats)
+    total_requests = len(all_requests)
+    #taux_succes = (total_served_on_time_ul + total_served_late_ul + total_served_passenger) / total_requests
+    taux_succes = (total_served_on_time_ul + total_served_late_ul) / total_requests
+
+    return {
+        "ul_servis_on_time": total_served_on_time_ul,
+        "ul_servis_late": total_served_late_ul,
+        "ul_servis": total_served_ul,
+        "ul_perdus": total_lost_ul,
+        #"passagers_servis": total_served_passenger,
+        "transferts_centrale": total_transfers,
+        "taux_succes": taux_succes*100
+    }
+
+# === Exécution 30 runs et sauvegarde Excel ===
+
+OUTPUT_FILE = "simulation_results_S3_demandes_2AP_7.xlsx"
+DEMANDS_FILE = "demandes_2AP_7.csv"
+
+results = []
+for run in range(Config.N_RUNS):
+    res = run_simulation(seed=run)
+    results.append(res)
+    print(f"✅ Run {run+1}/{Config.N_RUNS} terminé")
+
+df = pd.DataFrame(results)
+summary = df.agg(['mean','std'])
+summary.loc['ci95_inf'] = summary.loc['mean'] - (1.96 * summary.loc['std'] / np.sqrt(Config.N_RUNS))
+summary.loc['ci95_sup'] = summary.loc['mean'] + (1.96 * summary.loc['std'] / np.sqrt(Config.N_RUNS))
+
+with pd.ExcelWriter(OUTPUT_FILE) as writer:
+    df.to_excel(writer, sheet_name="Runs", index=False)
+    summary.to_excel(writer, sheet_name="Summary")
+
+print("="*60)
+print(f"✅ Résultats sauvegardés dans {OUTPUT_FILE}")
+print("\n📊 RÉSULTATS MOYENS SUR 30 RUNS (STRATÉGIE CENTRALE)")
+print("="*60)
+#for col in ['ul_servis_on_time','ul_servis_late','ul_perdus','passagers_servis','transferts_centrale','taux_succes']:
+for col in ['ul_servis_on_time','ul_servis_late','ul_servis','ul_perdus','transferts_centrale','taux_succes']:
+    mean = df[col].mean()
+    ci = 1.96*df[col].std()/np.sqrt(Config.N_RUNS)
+    print(f"• {col.replace('_',' ')} : {mean:.1f} ± {ci:.1f}")
